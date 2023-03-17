@@ -8,16 +8,26 @@ from game_parser import GameParser
 from model import Model
 import argparse
 
+from mineclip import MineCLIP
+from hydra import compose, initialize
+from omegaconf import OmegaConf
+initialize(config_path=".", version_base='1.1')
+
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# Where the data and model weight folders are stored
+scratch_dir = '/scratch/eecs692w23_class_root/eecs692w23_class/anrao/'
+
+# Given label number x and total labels n, convert into a one hot vector of shape (1,n)
 def onehot(x,n):
     retval = np.zeros(n)
     if x > 0:
         retval[x-1] = 1
     return retval
 
+# Statistics
 def print_epoch(data,acc_loss,lst):
     print(f'{acc_loss/len(lst):9.4f}',end='; ',flush=True)
     data = list(zip(*data))
@@ -29,11 +39,13 @@ def print_epoch(data,acc_loss,lst):
             print(f'({accuracy_score(a,b):5.3f},{f1_score(a,b,average="weighted"):5.3f},{len(b)})', end=' ',flush=True)
     print('', end='; ',flush=True)
 
+# Make splits for training and evaluation procedures. Shouldn't care much here.
 def make_splits():
     if not os.path.isfile('dataset_splits.json'):
-        dirs = sorted(glob('*_logs/*'))
+        dirs = sorted(glob(scratch_dir+'*_logs/*'))
         games = sorted(list(map(GameParser, dirs)), key=lambda x: len(x.question_pairs), reverse=True)
 
+        # Using python stepping to split data in 20-20-60 form
         test = games[0::5]
         val = games[1::5]
         train = games[2::5]+games[3::5]+games[4::5]
@@ -42,14 +54,19 @@ def make_splits():
         json.dump(dataset_splits, open('dataset_splits.json','w'))
     else:
         dataset_splits = json.load(open('dataset_splits.json'))
-    
+
     return dataset_splits
 
-def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_plan=False):
+# Model training and evaluation procedures
+def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_plan=False, clip_flag=False):
     data = []
     acc_loss = 0
     for game in lst:
-        l = model(game, global_plan=global_plan, player_plan=player_plan)
+
+        # Model file's function returns a list of ground truths and their associated predictions
+        # Predictions are of the form ['NO', 'MAYBE','YES'] -> [0,1,2]
+        # Predictions and ground truths at each time step occur for both players 1 and 2
+        l = model(game, global_plan=global_plan, player_plan=player_plan,clip=clip_flag)
         prediction = []
         ground_truth = []
         for gt, prd in l:
@@ -83,10 +100,10 @@ def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_pl
                 continue
             # print(p,g)
             prediction.append(torch.cat(p))
-            
+
             # ground_truth.append(torch.cat(g))
             ground_truth += g
-            
+
         if prediction:
             prediction = torch.stack(prediction)
         else:
@@ -96,10 +113,9 @@ def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_pl
             ground_truth = torch.tensor(ground_truth).long().to(DEVICE)
         else:
             continue
-            
-            
+
         loss = criterion(prediction,ground_truth)
-        
+
         if model.training and (not optimizer is None):
             loss.backward()
             # nn.utils.clip_grad_norm_(model.parameters(), 10)
@@ -113,7 +129,7 @@ def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_pl
 def main(args):
     print(args)
     print(f'PID: {os.getpid():6d}')
-    
+
     if args.seed=='Random':
         pass
     elif args.seed=='Fixed':
@@ -122,9 +138,9 @@ def main(args):
     else:
         print('Seed must be in [Random, Fixed], but got',args.seed)
         exit()
-    
+
     dataset_splits = make_splits()
-    
+
     if args.use_dialogue=='Yes':
         d_flag = True
     elif args.use_dialogue=='No':
@@ -132,11 +148,13 @@ def main(args):
     else:
         print('Use dialogue must be in [Yes, No], but got',args.use_dialogue)
         exit()
-        
+
+    # Flag to know when we want to train the model
+    train_flag = args.train
+
     if not args.experiment in list(range(9)):
         print('Experiment must be in',list(range(9)),', but got',args.experiment)
         exit()
-        
 
     if args.seq_model=='GRU':
         seq_model = 0
@@ -158,29 +176,42 @@ def main(args):
         print('Use Plan must be in [Yes, No], but got',args.plan)
         exit()
     print('global_plan', global_plan, 'player_plan', player_plan)
-    
-    if args.pov=='None':
-        val    = [GameParser(f,d_flag,0) for f in dataset_splits['validation']]
-        train  = [GameParser(f,d_flag,0) for f in dataset_splits['training']]
-        if args.experiment > 2:
-            val   += [GameParser(f,d_flag,4) for f in dataset_splits['validation']]
-            train += [GameParser(f,d_flag,4) for f in dataset_splits['training']]
-    elif args.pov=='Third':
-        val    = [GameParser(f,d_flag,3) for f in dataset_splits['validation']]
-        train  = [GameParser(f,d_flag,3) for f in dataset_splits['training']]
-    elif args.pov=='First':
-        val    = [GameParser(f,d_flag,1) for f in dataset_splits['validation']]
-        train  = [GameParser(f,d_flag,1) for f in dataset_splits['training']]
-        val   += [GameParser(f,d_flag,2) for f in dataset_splits['validation']]
-        train += [GameParser(f,d_flag,2) for f in dataset_splits['training']]
-    else:
-        print('POV must be in [None, First, Third], but got', args.pov)
-        exit()
+
+    clip = None
+    if args.clip:
+        cfg = compose(config_name="conf")
+        OmegaConf.set_struct(cfg, False)
+        ckpt = cfg.pop("ckpt")
+        OmegaConf.set_struct(cfg, True)
+        clip = MineCLIP(**cfg).to(DEVICE)
+        clip.load_ckpt(ckpt.path, strict=True)
+        clip = torch.compile(clip)
+
+
+    if train_flag:
+        if args.pov=='None':
+            val    = [GameParser(f,d_flag,0,clip) for f in dataset_splits['validation']]
+            train  = [GameParser(f,d_flag,0,clip) for f in dataset_splits['training']]
+            if args.experiment > 2:
+                val   += [GameParser(f,d_flag,4,clip) for f in dataset_splits['validation']]
+                train += [GameParser(f,d_flag,4,clip) for f in dataset_splits['training']]
+        elif args.pov=='Third':
+            val    = [GameParser(f,d_flag,3,clip) for f in dataset_splits['validation']]
+            train  = [GameParser(f,d_flag,3,clip) for f in dataset_splits['training']]
+        elif args.pov=='First':
+            val    = [GameParser(f,d_flag,1,clip) for f in dataset_splits['validation']]
+            train  = [GameParser(f,d_flag,1,clip) for f in dataset_splits['training']]
+            val   += [GameParser(f,d_flag,2,clip) for f in dataset_splits['validation']]
+            train += [GameParser(f,d_flag,2,clip) for f in dataset_splits['training']]
+        else:
+            print('POV must be in [None, First, Third], but got', args.pov)
+            exit()
 
     model = Model(seq_model).to(DEVICE)
 
     print(model)
-    model.train()
+    if train_flag:
+        model.train()
 
     learning_rate = 1e-3
     num_epochs = 1000#1#
@@ -200,78 +231,84 @@ def main(args):
     epochs_since_improvement = 0
     wait_epoch = 100
 
-    
 
-    for epoch in range(num_epochs):
-        print(f'{os.getpid():6d} {epoch+1:4d},',end=' ')
-        shuffle(train)
-        model.train()
-        do_split(model,train,args.experiment,criterion,optimizer=optimizer,global_plan=global_plan, player_plan=player_plan)
-        model.eval()
-        acc_loss, data = do_split(model,val,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan)
-        
-        data = list(zip(*data))
-        for x in data:
-            a, b = list(zip(*x))
-        f1 = f1_score(a,b,average='weighted')
-        if (max_f1 < f1):
-            max_f1 = f1
-            epochs_since_improvement = 0
-            print('^')
-            torch.save(model.cpu().state_dict(), args.save_path)
-            model = model.to(DEVICE)
-        else:
-            epochs_since_improvement += 1
-            print()
-        # if (min_acc_loss > acc_loss):
-        #     min_acc_loss = acc_loss
-        #     epochs_since_improvement = 0
-        #     print('^')
-        # else:
-        #     epochs_since_improvement += 1
-        #     print()
-            
-        if epoch > wait_epoch and epochs_since_improvement > 20:
-            break
+
+    if train_flag:
+        for epoch in range(num_epochs):
+            print(f'{os.getpid():6d} {epoch+1:4d},',end=' ')
+            shuffle(train)
+            model.train()
+            do_split(model,train,args.experiment,criterion,optimizer=optimizer,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip)
+            model.eval()
+            acc_loss, data = do_split(model,val,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip)
+
+            data = list(zip(*data))
+            for x in data:
+                a, b = list(zip(*x))
+            f1 = f1_score(a,b,average='weighted')
+            if (max_f1 < f1):
+                max_f1 = f1
+                epochs_since_improvement = 0
+                print('^')
+                torch.save(model.cpu().state_dict(), args.save_path)
+                model = model.to(DEVICE)
+            else:
+                epochs_since_improvement += 1
+                print()
+            # if (min_acc_loss > acc_loss):
+            #     min_acc_loss = acc_loss
+            #     epochs_since_improvement = 0
+            #     print('^')
+            # else:
+            #     epochs_since_improvement += 1
+            #     print()
+
+            if epoch > wait_epoch and epochs_since_improvement > 20:
+                break
     print()
     print('Test')
     model.load_state_dict(torch.load(args.save_path))
 
     val = None
     train = None
+
     if args.pov=='None':
-        test = [GameParser(f,d_flag,0) for f in dataset_splits['test']]
+        test = [GameParser(f,d_flag,0,clip) for f in dataset_splits['test']]
         if args.experiment > 2:
-            test += [GameParser(f,d_flag,4) for f in dataset_splits['test']]
+            test += [GameParser(f,d_flag,4,clip) for f in dataset_splits['test']]
     elif args.pov=='Third':
         test = [GameParser(f,d_flag,3) for f in dataset_splits['test']]
     elif args.pov=='First':
-        test  = [GameParser(f,d_flag,1) for f in dataset_splits['test']]
-        test += [GameParser(f,d_flag,2) for f in dataset_splits['test']]
+        test  = [GameParser(f,d_flag,1,clip) for f in dataset_splits['test']]
+        test += [GameParser(f,d_flag,2,clip) for f in dataset_splits['test']]
     else:
         print('POV must be in [None, First, Third], but got', args.pov)
     model.eval()
-    _, data = do_split(model,test,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan)
-    
+    _, data = do_split(model,test,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan, clip_flag=True)
+
     print()
     print(data)
     print()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process some integers.')
-    parser.add_argument('--pov', type=str, 
+    parser.add_argument('--pov', type=str,
                     help='point of view [None, First, Third]')
-    parser.add_argument('--use_dialogue', type=str, 
+    parser.add_argument('--use_dialogue', type=str,
                     help='Use dialogue [Yes, No]')
-    parser.add_argument('--plans', type=str, 
-                    help='Use dialogue [Yes, No]')
-    parser.add_argument('--seq_model', type=str, 
+    parser.add_argument('--plans', type=str,
+                    help='Use plans [Yes, No]')
+    parser.add_argument('--seq_model', type=str,
                     help='point of view [GRU, LSTM, Transformer]')
-    parser.add_argument('--experiment', type=int, 
+    parser.add_argument('--experiment', type=int,
                     help='point of view [0:AggQ1, 1:AggQ2, 2:AggQ3, 3:P0Q1, 4:P0Q2, 5:P0Q3, 6:P1Q1, 7:P1Q2, 8:P1Q3]')
-    parser.add_argument('--save_path', type=str, 
+    parser.add_argument('--save_path', type=str,
                     help='path where to save model')
-    parser.add_argument('--seed', type=str, 
+    parser.add_argument('--seed', type=str,
                     help='Use random or fixed seed [Random, Fixed]')
-    
+    parser.add_argument('--train',  action='store_true',
+                    help='Training')
+    parser.add_argument('--clip',  action='store_true',
+                    help='Flag to enable clip embeddings to be used')
+
     main(parser.parse_args())

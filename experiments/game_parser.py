@@ -4,6 +4,10 @@ import torch, random, numpy as np
 from transformers import BertTokenizer, BertModel
 import cv2
 import imageio
+from mineclip import MineCLIP
+from hydra import compose, initialize
+from omegaconf import OmegaConf
+
 
 random.seed(0)
 torch.manual_seed(1)
@@ -17,7 +21,7 @@ def onehot(x,n):
     return retval
 
 class GameParser:
-    def __init__(self, game_path, load_dialogue=True, pov=0):
+    def __init__(self, game_path, load_dialogue=True, pov=0, clip=None):
         # print(game_path,end = ' ')
         self.load_dialogue = load_dialogue
         if pov not in (0,1,2,3,4):
@@ -36,15 +40,20 @@ class GameParser:
         self.questions_file = glob(os.path.join(game_path,'web*log'))[0]
         self.plan_file = glob(os.path.join(game_path,'plan*json'))[0]
         self.plan = json.load(open(self.plan_file))
-        self.img_w = 96
-        self.img_h = 96
-        
-        self.__parse_dialogue()
+        self.img_w = 256
+        self.img_h = 160
+        self.clip = clip
+
+        if clip:
+            self.__parse_dialogue_clip()
+        else:
+            self.__parse_dialogue()
+
         self.__parse_questions()
         self.__parse_start_end()
         self.__parse_question_pairs()
         self.__load_videos()
-        
+
         materials = glob('../mean/dist/img/materials/*.png') + glob('mean/dist/img/materials/*.png')
         materials = sorted([m.split('/')[-1].split('.')[0] for m in materials])
         materials = [m for m in materials if not 'NULL' in m]
@@ -55,13 +64,13 @@ class GameParser:
         tools = glob('../mean/dist/img/tools/*.png') + glob('mean/dist/img/tools/*.png')
         tools = sorted([t.split('/')[-1].split('.')[0] for t in tools])
         tools = [t for t in tools if not 'NULL' in t]
-        
+
         self.materials_dict = {x:i+1 for i,x in enumerate(materials)}
         self.mines_dict = {x:i+1 for i,x in enumerate(mines)}
         self.tools_dict = {x:i+1 for i,x in enumerate(tools)}
-        
+
         # print(len(self.materials_dict))
-        
+
         self.global_plan = []
         mine_counter = 0
         for n,v in zip(self.plan['materials'],self.plan['full']):
@@ -81,7 +90,7 @@ class GameParser:
             t = onehot(self.tools_dict[self.plan['tools'][v['tools'][0]]],len(self.tools_dict))
             step = np.concatenate((mat,m1,m2,mine,t))
             self.global_plan.append(step)
-        
+
         self.player1_plan = []
         mine_counter = 0
         for n,v in zip(self.plan['materials'],self.plan['player1']):
@@ -105,7 +114,7 @@ class GameParser:
             t = onehot(self.tools_dict[self.plan['tools'][v['tools'][0]]],len(self.tools_dict))
             step = np.concatenate((mat,m1,m2,mine,t))
             self.player1_plan.append(step)
-        
+
         self.player2_plan = []
         mine_counter = 0
         for n,v in zip(self.plan['materials'],self.plan['player2']):
@@ -129,9 +138,10 @@ class GameParser:
             t = onehot(self.tools_dict[self.plan['tools'][v['tools'][0]]],len(self.tools_dict))
             step = np.concatenate((mat,m1,m2,mine,t))
             self.player2_plan.append(step)
-        
+
         self.__iter_ts = self.start_ts
-            
+
+    # ADDED: c_f to iterator retval
     def __next__(self):
         if self.__iter_ts < self.end_ts:
             if self.load_dialogue:
@@ -139,43 +149,50 @@ class GameParser:
                 d = d if d else None
             else:
                 d = None
-            
+
             # q = [x for x in self.question_pairs if (x[0][0] < self.__iter_ts) and (x[0][1] > self.__iter_ts)]
             q = [x for x in self.question_pairs if (x[0][1] == self.__iter_ts)]
             q = q[0] if q else None
             frame_idx = self.__iter_ts - self.start_ts
             if self.load_third_person:
                 frames = self.third_pers_frames
+                c_frames = self.clip_third
             elif self.load_player1:
                 frames = self.player1_pov_frames
+                c_frames = self.clip_first
             elif self.load_player2:
                 frames = self.player2_pov_frames
+                c_frames = self.clip_second
             else:
                 frames = np.array([0])
+                c_frames = np.array([0])
             if len(frames) == 1:
-                f = np.zeros((self.img_h,self.img_w,3))
+                f = np.zeros((self.img_w,self.img_h,3))
+                c_f = np.zeros((1,512))
             else:
                 if frame_idx < frames.shape[0]:
                     f = frames[frame_idx]
+                    c_f = c_frames[frame_idx]
                 else:
-                    f = np.zeros((self.img_h,self.img_w,3))
-            retval = (self.__iter_ts,d,q,f)
+                    f = np.zeros((self.img_w,self.img_h,3))
+                    c_f = np.zeros((1,512))
+            retval = (self.__iter_ts,d,q,f,c_f)
             self.__iter_ts += 1
             return retval
         self.__iter_ts = self.start_ts
         raise StopIteration()
-    
+
     def __iter__(self):
         return self
-    
+
     def __load_videos(self):
         d = self.end_ts - self.start_ts
-        
+
         if self.load_third_person:
             try:
                 self.third_pers_file = glob(os.path.join(self.game_path,'third*gif'))[0]
                 np_file = self.third_pers_file[:-3]+'npz'
-                if os.path.isfile(np_file):
+                if True is False and os.path.isfile(np_file):
                     self.third_pers_frames = np.load(np_file)['data']
                 else:
                     frames = imageio.get_reader(self.third_pers_file, '.gif')
@@ -189,7 +206,7 @@ class GameParser:
                     print('saved')
             except Exception as e:
                 self.third_pers_frames = np.array([0])
-                
+
             if self.third_pers_frames.shape[0]//d < 10:
                 self.third_pov_frame_rate = 6
             else:
@@ -201,16 +218,20 @@ class GameParser:
                     else:
                         self.third_pov_frame_rate = 60
             self.third_pers_frames = self.third_pers_frames[::self.third_pov_frame_rate]
+            self.clip_third = None if not self.clip else self.clip.forward_image_features(np.array(self.third_pers_frames))
+            if len(self.third_pers_frames.shape) == 4:
+                self.clip_third = None if not self.clip else [self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)).cpu().detach().numpy() for frame in self.third_pers_frames]
         else:
             self.third_pers_frames = np.array([0])
-            
+            self.clip_third = np.array([0])
+
         if self.load_player1:
             try:
                 self.player1_pov_file = glob(os.path.join(self.game_path,'play1*gif'))[0]
                 np_file = self.player1_pov_file[:-3]+'npz'
-                if os.path.isfile(np_file):
+                if True is False and os.path.isfile(np_file):
                     self.player1_pov_frames = np.load(np_file)['data']
-                else:                
+                else:
                     frames = imageio.get_reader(self.player1_pov_file, '.gif')
                     reshaper  = lambda x: cv2.resize(x,(self.img_h,self.img_w))
                     self.player1_pov_frames = np.array([reshaper(f[:,:,2::-1]) for f in frames])
@@ -219,7 +240,7 @@ class GameParser:
                     print('saved')
             except Exception as e:
                 self.player1_pov_frames = np.array([0])
-            
+
             if self.player1_pov_frames.shape[0]//d < 10:
                 self.player1_pov_frame_rate = 6
             else:
@@ -231,14 +252,21 @@ class GameParser:
                     else:
                         self.player1_pov_frame_rate = 60
             self.player1_pov_frames = self.player1_pov_frames[::self.player1_pov_frame_rate]
+            if len(self.player1_pov_frames.shape) == 4:
+                self.clip_first = None if not self.clip else [self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)).cpu().detach().numpy() for frame in self.player1_pov_frames]
+            else:
+                print(self.player1_pov_frames)
+                self.player1_pov_frames = np.array([0])
+                self.clip_first=[np.zeros((1,512))]
         else:
             self.player1_pov_frames = np.array([0])
-            
+            self.clip_first = np.array([0])
+
         if self.load_player2:
             try:
                 self.player2_pov_file = glob(os.path.join(self.game_path,'play2*gif'))[0]
                 np_file = self.player2_pov_file[:-3]+'npz'
-                if os.path.isfile(np_file):
+                if True is False and os.path.isfile(np_file):
                     self.player2_pov_frames = np.load(np_file)['data']
                 else:
                     frames = imageio.get_reader(self.player2_pov_file, '.gif')
@@ -249,7 +277,7 @@ class GameParser:
                     print('saved')
             except Exception as e:
                 self.player2_pov_frames = np.array([0])
-                
+
             if self.player2_pov_frames.shape[0]//d < 10:
                 self.player2_pov_frame_rate = 6
             else:
@@ -261,17 +289,24 @@ class GameParser:
                     else:
                         self.player2_pov_frame_rate = 60
             self.player2_pov_frames = self.player2_pov_frames[::self.player2_pov_frame_rate]
+            if len(self.player2_pov_frames.shape) == 4:
+                self.clip_second = None if not self.clip else [self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)).cpu().detach().numpy() for frame in self.player2_pov_frames]
+            else:
+                print(self.player2_pov_frames)
+                self.clip_second=[np.zeros((1,512))]
+                self.player2_pov_frames = np.array([0])
         else:
             self.player2_pov_frames = np.array([0])
+            self.clip_second = np.array([0])
 
     def __parse_question_pairs(self):
-        question_dict = {}        
+        question_dict = {}
         for q in self.questions:
             k = q[2][0][1] + q[2][1][1]
             if not k in question_dict:
                 question_dict[k] = []
             question_dict[k].append(q)
-        
+
         self.question_pairs = []
         for k,v in question_dict.items():
             if len(v) == 2:
@@ -294,14 +329,14 @@ class GameParser:
             self.question_pairs = [sorted(q, key=lambda x: x[1],reverse=True) for q in self.question_pairs]
         else:
             self.question_pairs = [sorted(q, key=lambda x: x[1]) for q in self.question_pairs]
-        
-        
+
+
         self.question_pairs = [((a[0], b[0], a[1], b[1], a[2], b[2]), (a[3], b[3])) for a,b in self.question_pairs]
 
     def __parse_dialogue(self):
         self.dialogue_events = []
         # if not self.load_dialogue:
-        #     return 
+        #     return
         save_path = os.path.join(self.game_path,f'dialogue_{self.game_path.split("/")[1]}.pkl')
         if os.path.isfile(save_path):
             self.dialogue_events = pickle.load(open( save_path, "rb" ))
@@ -333,17 +368,45 @@ class GameParser:
                 self.dialogue_events.append((ts,player,event,outputs))
         pickle.dump(self.dialogue_events, open( save_path, "wb" ))
         print(f'Saved to {save_path}',flush=True)
-        
+
+    def __parse_dialogue_clip(self):
+        self.dialogue_events = []
+        # if not self.load_dialogue:
+        #     return
+        save_path = os.path.join(self.game_path,f'clip_dialogue_{self.game_path.split("/")[1]}.pkl')
+        if True is True and os.path.isfile(save_path):
+            self.dialogue_events = pickle.load(open( save_path, "rb" ))
+            return
+        for x in open(self.dialogue_file):
+            if '[Async Chat Thread' in x:
+                ts = list(map(int,x.split(' [')[0].strip('[]').split(':')))
+                ts = 3600*ts[0] + 60*ts[1] + ts[2]
+                player, event = x.strip().split('/INFO]: []<sledmcc')[1].split('> ',1)
+                event = event.lower()
+                event = ''.join([x if x in string.ascii_lowercase else f' {x} ' for x in event]).strip()
+                event = event.replace('  ',' ').replace('  ',' ')
+                player = int(player)
+
+                # Get text embedding from CLIP
+                outputs = self.clip.encode_text(
+                    event,  # Sentence to encode.
+                )
+                outputs = outputs.cpu().data.numpy().flatten()
+                print(outputs.shape)
+                self.dialogue_events.append((ts,player,event,outputs))
+        pickle.dump(self.dialogue_events, open( save_path, "wb" ))
+        print(f'Saved to {save_path}',flush=True)
+
     def __parse_questions(self):
         self.questions = []
         for x in open(self.questions_file):
             if x[0] == '#':
                 ts, qs = x.strip().split(' Number of records inserted: 1 # player')
                 # print(ts,qs)
-                
+
                 ts = list(map(int,ts.split(' ')[5].split(':')))
                 ts = 3600*ts[0] + 60*ts[1] + ts[2]
-                
+
                 player = int(qs[0])
                 questions = qs[2:].split(';')
                 answers =[x[7:] for x in questions[3:]]
@@ -351,9 +414,9 @@ class GameParser:
                 questions[0] = (int(questions[0][0] == 'Have'), questions[0][-3])
                 questions[1] = (int(questions[1][2] == 'know'), questions[1][-1])
                 questions[2] = int(questions[2][1] == 'are')
-                
+
                 self.questions.append((ts,player,questions,answers))
-    def __parse_start_end(self):        
+    def __parse_start_end(self):
         self.start_ts = [x.strip() for x in open(self.dialogue_file) if 'THEY ARE PLAYER' in x][1]
         self.start_ts = list(map(int,self.start_ts.split('] [')[0][1:].split(':')))
         self.start_ts = 3600*self.start_ts[0] + 60*self.start_ts[1] + self.start_ts[2]
@@ -361,7 +424,7 @@ class GameParser:
             self.start_ts = max(self.start_ts, self.questions[0][0]-75)
         except Exception as e:
             pass
-        
+
         self.end_ts = [x.strip() for x in open(self.dialogue_file) if 'Stopping' in x]
         if self.end_ts:
             self.end_ts = self.end_ts[0]
