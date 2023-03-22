@@ -5,6 +5,7 @@ from sklearn.metrics import accuracy_score, f1_score
 import matplotlib.pyplot as plt
 import numpy as np
 
+scratch_dir = ''
 
 plt.rcParams.update({'font.size': 20})
 
@@ -18,7 +19,7 @@ games = [x for x in sum(dataset_splits.values(),[]) if 'saved' in x]
 # games = sum(dataset_splits.values(),[])
 
 
-game_dirs = sorted(glob('*_logs/*'))
+game_dirs = sorted(glob(scratch_dir+'*_logs/*'))
 # print('\n'.join(game_dirs))
 game_nb = []
 for g in game_dirs:
@@ -38,16 +39,16 @@ for g in game_dirs:
 game_nb = dict([(g[0],g[1]) for g in game_nb])
 # for k,v in game_nb.items():
 #     print(k,v)
-        
+
 # exit()
 
 game_types = {}
 for x in games:
-    game = GameParser(x)
+    game = GameParser(scratch_dir+x)
     q_pairs = [q for _,_,q,_ in game if not q is None]
     dlg = [d for _,d,_,_ in game if not d is None]
     dts = (game.end_ts - game.start_ts)
-    plan = json.load(open(glob(x+'/plan*')[0]))
+    plan = json.load(open(glob(scratch_dir+x+'/plan*')[0]))
     skills = '   Shared' if (sum([x['tools'][0] for x in plan['full']]))==0 else 'Disparate'
     knowledge = 'Disparate' if -1 in sum([sum(x['make'],[]) for x in plan['player1']+plan['player2']],[]) else '   Shared'
     key = f'{skills} Skills & {knowledge} Knowledge'
@@ -82,9 +83,9 @@ games = sum(dataset_splits.values(),[])
 
 data = []
 for x in games:
-    game = GameParser(x)
+    game = GameParser(scratch_dir+x)
     q_pairs = [q for _,_,q,_ in game if not q is None]
-    plan = json.load(open(glob(x+'/plan*')[0]))
+    plan = json.load(open(glob(scratch_dir+x+'/plan*')[0]))
     skills = 'Disparate' if (sum([x['tools'][0] for x in plan['full']]))==0 else '   Shared'
     knowledge = 'Disparate' if -1 in sum([sum(x['make'],[]) for x in plan['player1']+plan['player2']],[]) else '   Shared'
     key = f'{skills} Skills {knowledge} Knowledge'
@@ -103,7 +104,7 @@ x = zip(*x)
 
 for v,a in zip(x,['a1','f1','a2','f2','a3','f3']):
     p1, p2 = dts, v
-    
+
     plt.cla(); plt.clf();plt.close()
     plt.scatter(p1,p2)
     mp1 = np.mean(p1)
@@ -114,7 +115,7 @@ for v,a in zip(x,['a1','f1','a2','f2','a3','f3']):
     plt.plot(np.unique(p1), np.poly1d(np.polyfit(p1, p2, 1))(np.unique(p1)), color='red')
     plt.xlabel('Accuracy' if a[0]=='a' else 'F1 Score')
     plt.ylabel('Game length (minutes)')
-    
+
     plt.savefig(f'scatter_{a}.png')
     # print(c,np.linalg.det(np.corrcoef(p1,p2)),np.arctan(list(np.poly1d(np.polyfit(p1, p2, 1)))[0]))
     print(f'{c:0.3f}')
@@ -127,12 +128,12 @@ games = sum(dataset_splits.values(),[])
 
 data = []
 for gm in games:
-    game = GameParser(gm)
+    game = GameParser(scratch_dir+gm)
     try:
         ts,q_pairs = zip(*[(t,q) for t,_,q,_ in game if not q is None])
     except Exception:
         continue
-    plan = json.load(open(glob(gm+'/plan*')[0]))
+    plan = json.load(open(glob(scratch_dir+gm+'/plan*')[0]))
     skills = 'Disparate' if (sum([x['tools'][0] for x in plan['full']]))==0 else '   Shared'
     knowledge = 'Disparate' if -1 in sum([sum(x['make'],[]) for x in plan['player1']+plan['player2']],[]) else '   Shared'
     key = f'{skills} Skills {knowledge} Knowledge'
@@ -141,8 +142,8 @@ for gm in games:
         g,p,ts = zip(*[x[0][1]+(x[1],) for x in zip(q_pairs,ts) if not x[0][0][2]==x[0][0][3]])
         for x,y,t in zip(g,p,ts):
             # tpl += [accuracy_score(x,y), f1_score(x,y,average="weighted")]
-            
-            data.append((max(0.1001,(t-game.start_ts)/dts), min(5,game_nb[gm]), x[0]==y[0], x[1]==y[1], x[2]==y[2]))
+
+            data.append((max(0.1001,(t-game.start_ts)/dts), min(5,game_nb[scratch_dir+gm]), x[0]==y[0], x[1]==y[1], x[2]==y[2]))
 
 plt.rcParams.update({'font.size': 14})
 ts, nb, e1,e2,e3 = zip(*data)
@@ -153,7 +154,7 @@ for i,(ex,ttl) in enumerate(zip([e1,e2,e3],['Completed Task Status', 'Other Play
     bins = np.linspace(0.1, 1, 10)
     # bins[0]=0
     # bins = np.array(range(15))*75
-    
+
     # bins = np.array([75,150,225,300,375,525,750,1100])
     h1 = np.histogram([t for t,e in zip(ts,ex) if e], bins)[0]
     h2 = np.histogram([t for t,e in zip(ts,ex) if not e], bins)[0]
@@ -165,7 +166,7 @@ for i,(ex,ttl) in enumerate(zip([e1,e2,e3],['Completed Task Status', 'Other Play
     ax1.legend(['Matches', 'Mismatches'])
     for x in bins:
         ax1.plot([x,x],[0,80],color='grey',linewidth=0.5,linestyle=':')
-    
+
     ax2 = ax1.twinx()
     p1 = [np.mean([bins[i],bins[i+1]])for i in range(len(bins)-1)] #bins[1:]-bins[1]/2
     p2 = h1/(h2+h1)
@@ -197,7 +198,7 @@ for i,(ex,ttl) in enumerate(zip([e1,e2,e3],['Completed Task Status', 'Other Play
     # bins = np.linspace(0.5, 5.5, 6)
     # # bins[0]=0
     # # bins = np.array(range(15))*75
-    
+
     # # bins = np.array([75,150,225,300,375,525,750,1100])
     # h1 = np.histogram([t for t,e in zip(nb,ex) if e], bins)[0]
     # h2 = np.histogram([t for t,e in zip(nb,ex) if not e], bins)[0]
@@ -209,7 +210,7 @@ for i,(ex,ttl) in enumerate(zip([e1,e2,e3],['Completed Task Status', 'Other Play
     # ax1.legend(['Matches', 'Mismatches'])
     # for x in bins:
     #     ax1.plot([x,x],[0,80],color='grey',linewidth=0.5,linestyle=':')
-    
+
     # ax2 = ax1.twinx()
     # p1 = [np.mean([bins[i],bins[i+1]])for i in range(len(bins)-1)] #bins[1:]-bins[1]/2
     # p2 = h1/(h2+h1)
@@ -241,14 +242,14 @@ games = sum(dataset_splits.values(),[])
 data = []
 for x in games:
     data.append([])
-    game = GameParser(x,True,0)
+    game = GameParser(scratch_dir+x,True,0)
     for t,d,q,_ in game:
         if not q is None:
             data[-1].append((q,[]))
         if not d is None:
             if data[-1]:
                 data[-1][-1][1].append(d)
-    game = GameParser(x,True,4)
+    game = GameParser(scratch_dir+x,True,4)
     for t,d,q,_ in game:
         if not q is None:
             data[-1].append((q,[]))
@@ -357,7 +358,7 @@ for i,ttl in enumerate(['Completed Task Status', 'Other Player\'s Knowledge', 'O
         # print(max([x[0] for x in hdata]))
         # bins = np.linspace(0, max([x[0] for x in hdata]), max([x[0] for x in hdata])//2)
         bins = np.array([1,2])
-        
+
         x1 = [[b for a,b,c,_ in hdata1[i] if c and a==tp] for tp in range(-1,1)]
         x2 = [[b for a,b,c,_ in hdata1[i] if not c and a==tp] for tp in range(-1,1)]
         s1 = np.array(list(map(np.std,x1)))
@@ -380,7 +381,7 @@ for i,ttl in enumerate(['Completed Task Status', 'Other Player\'s Knowledge', 'O
         ax1.set_xticks(bins)
         # exit()
         plt.savefig(f'avg_dlg_count_a_{i}_{j}.png')
-        
+
         plt.cla(); plt.clf();plt.close()
         fig, ax1 = plt.subplots(figsize=(7, 5))
         x1,x2 = zip(x1,x2)
@@ -397,8 +398,8 @@ for i,ttl in enumerate(['Completed Task Status', 'Other Player\'s Knowledge', 'O
         ax1.set_xticklabels(['Matches','Mismatches',])
         plt.title(ttl)
         plt.legend()
-        
-        
+
+
         # plt.plot(bins,x1,color='blue')
         # plt.plot(bins,x2,color='orange')
         # ax2 = ax1.twinx()
@@ -406,11 +407,11 @@ for i,ttl in enumerate(['Completed Task Status', 'Other Player\'s Knowledge', 'O
         ax1.set_xticks(bins)
         # exit()
         plt.savefig(f'avg_dlg_count_{i}_{j}.png')
-        
+
         plt.cla(); plt.clf();plt.close()
         fig, ax1 = plt.subplots(figsize=(7, 5))
         bins = np.array([1,2,3,4])
-        
+
         x1 = [[b for a,b,c,d in hdata1[i] if     c and     d and a==tp] for tp in range(-1,2)]
         x2 = [[b for a,b,c,d in hdata1[i] if not c and     d and a==tp] for tp in range(-1,2)]
         x3 = [[b for a,b,c,d in hdata1[i] if     c and not d and a==tp] for tp in range(-1,2)]
@@ -458,7 +459,7 @@ for i,ttl in enumerate(['Completed Task Status', 'Other Player\'s Knowledge', 'O
         plt.title(ttl)
         plt.legend()
         plt.savefig(f'avg_dlg_count_2nd_{i}_{j}.png')
-        
+
         continue
-        
-        
+
+

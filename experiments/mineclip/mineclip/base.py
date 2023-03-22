@@ -15,6 +15,7 @@ __all__ = ["VideoRewardBase"]
 MC_IMAGE_MEAN = (0.3331, 0.3245, 0.3051)
 MC_IMAGE_STD = (0.2439, 0.2493, 0.2873)
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class VideoRewardBase(nn.Module):
     def __init__(

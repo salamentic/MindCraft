@@ -58,7 +58,7 @@ def make_splits():
     return dataset_splits
 
 # Model training and evaluation procedures
-def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_plan=False, clip_flag=False):
+def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_plan=False, clip_flag=False, scheduler = None):
     data = []
     acc_loss = 0
     for game in lst:
@@ -124,6 +124,8 @@ def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_pl
         acc_loss += loss.item()
         # return data, acc_loss + loss.item()
     print_epoch(data,acc_loss,lst)
+    if scheduler:
+        scheduler.step()
     return acc_loss, data
 
 def main(args):
@@ -186,6 +188,7 @@ def main(args):
         clip = MineCLIP(**cfg).to(DEVICE)
         clip.load_ckpt(ckpt.path, strict=True)
         clip = torch.compile(clip)
+        clip.eval()
 
 
     if train_flag:
@@ -216,13 +219,10 @@ def main(args):
     learning_rate = 1e-3
     num_epochs = 1000#1#
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    # optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
-    # optimizer = optim.Adagrad(model.parameters(), lr=learning_rate)
-    # optimizer = optim.Adadelta(model.parameters())
-    # optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+    #optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=0.2)
     criterion = nn.CrossEntropyLoss()
-    # criterion = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=0, last_epoch=-1, verbose=False)
 
     print(str(criterion), str(optimizer))
 
@@ -238,7 +238,7 @@ def main(args):
             print(f'{os.getpid():6d} {epoch+1:4d},',end=' ')
             shuffle(train)
             model.train()
-            do_split(model,train,args.experiment,criterion,optimizer=optimizer,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip)
+            do_split(model,train,args.experiment,criterion,optimizer=optimizer,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip, scheduler=scheduler)
             model.eval()
             acc_loss, data = do_split(model,val,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip)
 
@@ -277,7 +277,7 @@ def main(args):
         if args.experiment > 2:
             test += [GameParser(f,d_flag,4,clip) for f in dataset_splits['test']]
     elif args.pov=='Third':
-        test = [GameParser(f,d_flag,3) for f in dataset_splits['test']]
+        test = [GameParser(f,d_flag,3,clip) for f in dataset_splits['test']]
     elif args.pov=='First':
         test  = [GameParser(f,d_flag,1,clip) for f in dataset_splits['test']]
         test += [GameParser(f,d_flag,2,clip) for f in dataset_splits['test']]

@@ -42,12 +42,14 @@ class GameParser:
         self.plan = json.load(open(self.plan_file))
         self.img_w = 256
         self.img_h = 160
+        self.vid_len = 16
         self.clip = clip
 
         if clip:
             self.__parse_dialogue_clip()
         else:
             self.__parse_dialogue()
+            self.dialogue_events = None
 
         self.__parse_questions()
         self.__parse_start_end()
@@ -176,6 +178,7 @@ class GameParser:
                 else:
                     f = np.zeros((self.img_w,self.img_h,3))
                     c_f = np.zeros((1,512))
+            print(d)
             retval = (self.__iter_ts,d,q,f,c_f)
             self.__iter_ts += 1
             return retval
@@ -218,9 +221,25 @@ class GameParser:
                     else:
                         self.third_pov_frame_rate = 60
             self.third_pers_frames = self.third_pers_frames[::self.third_pov_frame_rate]
-            self.clip_third = None if not self.clip else self.clip.forward_image_features(np.array(self.third_pers_frames))
             if len(self.third_pers_frames.shape) == 4:
-                self.clip_third = None if not self.clip else [self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)).cpu().detach().numpy() for frame in self.third_pers_frames]
+                # For each Frame:
+                # (F, [C,H,W]) -> [1,C,H,W] -> [1,512] -> tile to get [16,512] ->
+                # [1,16,512] -> [1,512]
+                # We can turn this into a sliding window of 16! Shoud not be that bad.
+
+                # Duplicate mode
+                if not self.clip:
+                    self.clip_third = None
+                elif len(self.third_pers_frames) < self.vid_len:
+                    self.clip_third = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.third_pers_frames]
+                else:
+                    self.clip_third = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.third_pers_frames[:self.vid_len]]
+                    sliding_window = np.lib.stride_tricks.sliding_window_view(self.third_pers_frames, (self.vid_len, self.img_w, self.img_h, 3))
+                    sliding_window = sliding_window.reshape((len(self.third_pers_frames) - self.vid_len + 1, self.vid_len, self.img_w, self.img_h, 3))
+                    self.clip_third = np.concatenate((self.clip_third, np.array([self.clip.encode_video(torch.Tensor(win).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
+            else:
+                self.third_pers_frames = np.array([0])
+                self.clip_third=[np.zeros((1,512))]
         else:
             self.third_pers_frames = np.array([0])
             self.clip_third = np.array([0])
@@ -233,7 +252,7 @@ class GameParser:
                     self.player1_pov_frames = np.load(np_file)['data']
                 else:
                     frames = imageio.get_reader(self.player1_pov_file, '.gif')
-                    reshaper  = lambda x: cv2.resize(x,(self.img_h,self.img_w))
+                    reshaper  = lambda x: cv2.resize(x,(self.img_w,self.img_h))
                     self.player1_pov_frames = np.array([reshaper(f[:,:,2::-1]) for f in frames])
                     print(np_file,end=' ')
                     np.savez_compressed(open(np_file,'wb'), data=self.player1_pov_frames)
@@ -253,14 +272,31 @@ class GameParser:
                         self.player1_pov_frame_rate = 60
             self.player1_pov_frames = self.player1_pov_frames[::self.player1_pov_frame_rate]
             if len(self.player1_pov_frames.shape) == 4:
-                self.clip_first = None if not self.clip else [self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)).cpu().detach().numpy() for frame in self.player1_pov_frames]
+                if not self.clip:
+                    self.clip_first = None
+                if os.path.isfile(self.player1_pov_file[:-4]+'_clip_vid.npz'):
+                    self.clip_first = np.load(self.player1_pov_file[:-4]+'_clip_vid.npz')['data']
+                    print("Loaded clip embed")
+                elif len(self.player1_pov_frames) < self.vid_len:
+                    self.clip_first = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.player1_pov_frames]
+                    np.savez_compressed(open(self.player1_pov_file[:-4]+'_clip_vid.npz','wb'), data=self.clip_first)
+                    print('saved clip video embed')
+                else:
+                    self.clip_first = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.player1_pov_frames[:self.vid_len]]
+                    sliding_window = np.lib.stride_tricks.sliding_window_view(self.player1_pov_frames, (self.vid_len, self.img_w, self.img_h, 3))
+                    sliding_window = sliding_window.reshape((len(self.player1_pov_frames) - self.vid_len + 1, self.vid_len, self.img_w, self.img_h, 3))
+                    self.clip_first = np.concatenate((self.clip_first, np.array([self.clip.encode_video(torch.Tensor(win).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
+                    np.savez_compressed(open(self.player1_pov_file[:-4]+'_clip_vid.npz','wb'), data=self.clip_first)
+                    print('saved clip video embed')
             else:
-                print(self.player1_pov_frames)
                 self.player1_pov_frames = np.array([0])
                 self.clip_first=[np.zeros((1,512))]
         else:
             self.player1_pov_frames = np.array([0])
             self.clip_first = np.array([0])
+
+        if len(self.clip_first) != 1:
+
 
         if self.load_player2:
             try:
@@ -290,7 +326,15 @@ class GameParser:
                         self.player2_pov_frame_rate = 60
             self.player2_pov_frames = self.player2_pov_frames[::self.player2_pov_frame_rate]
             if len(self.player2_pov_frames.shape) == 4:
-                self.clip_second = None if not self.clip else [self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)).cpu().detach().numpy() for frame in self.player2_pov_frames]
+                if not self.clip:
+                    self.clip_second = None
+                elif len(self.player2_pov_frames) < self.vid_len:
+                    self.clip_second = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.player2_pov_frames]
+                else:
+                    self.clip_second = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.player2_pov_frames[:self.vid_len]]
+                    sliding_window = np.lib.stride_tricks.sliding_window_view(self.player2_pov_frames, (self.vid_len, self.img_w, self.img_h, 3))
+                    sliding_window = sliding_window.reshape((len(self.player2_pov_frames) - self.vid_len + 1, self.vid_len, self.img_w, self.img_h, 3))
+                    self.clip_second = np.concatenate((self.clip_second, np.array([self.clip.encode_video(torch.Tensor(win).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
             else:
                 print(self.player2_pov_frames)
                 self.clip_second=[np.zeros((1,512))]
@@ -374,7 +418,7 @@ class GameParser:
         # if not self.load_dialogue:
         #     return
         save_path = os.path.join(self.game_path,f'clip_dialogue_{self.game_path.split("/")[1]}.pkl')
-        if True is True and os.path.isfile(save_path):
+        if True is False and os.path.isfile(save_path):
             self.dialogue_events = pickle.load(open( save_path, "rb" ))
             return
         for x in open(self.dialogue_file):
@@ -414,8 +458,8 @@ class GameParser:
                 questions[0] = (int(questions[0][0] == 'Have'), questions[0][-3])
                 questions[1] = (int(questions[1][2] == 'know'), questions[1][-1])
                 questions[2] = int(questions[2][1] == 'are')
-
                 self.questions.append((ts,player,questions,answers))
+
     def __parse_start_end(self):
         self.start_ts = [x.strip() for x in open(self.dialogue_file) if 'THEY ARE PLAYER' in x][1]
         self.start_ts = list(map(int,self.start_ts.split('] [')[0][1:].split(':')))
