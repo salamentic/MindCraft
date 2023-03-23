@@ -1,19 +1,19 @@
 from glob import glob
+import hashlib
 import os, json, sys
-import torch, random, torch.nn as nn, numpy as np
-from torch import optim
+import argparse
 from random import shuffle
 from sklearn.metrics import accuracy_score, f1_score
+
+import torch, random, torch.nn as nn, numpy as np
+from torch import optim
+from torch.cuda.amp import GradScaler
+
 from game_parser import GameParser
 from model import Model
-import argparse
 
 from mineclip import MineCLIP
-from hydra import compose, initialize
 from omegaconf import OmegaConf
-initialize(config_path=".", version_base='1.1')
-
-
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -57,72 +57,74 @@ def make_splits():
 
     return dataset_splits
 
+def construct_gt_pred(l, game, exp):
+    prediction = []
+    ground_truth = []
+    for gt, prd in l:
+        lbls = [int(a==b) for a,b in zip(gt[0],gt[1])]
+        lbls += [['NO', 'MAYBE', 'YES'].index(gt[0][0]),['NO', 'MAYBE', 'YES'].index(gt[0][1])]
+        if gt[0][2] in game.materials_dict:
+            lbls.append(game.materials_dict[gt[0][2]])
+        else:
+            lbls.append(0)
+        lbls += [['NO', 'MAYBE', 'YES'].index(gt[1][0]),['NO', 'MAYBE', 'YES'].index(gt[1][1])]
+        if gt[1][2] in game.materials_dict:
+            lbls.append(game.materials_dict[gt[1][2]])
+        else:
+            lbls.append(0)
+        prd = prd[exp:exp+1]
+        lbls = lbls[exp:exp+1]
+        data.append([(g,torch.argmax(p).item()) for p,g in zip(prd,lbls)])
+        # p, g = zip(*[(p,torch.eye(p.shape[0]).float()[g]) for p,g in zip(prd,lbls)])
+        if exp == 0:
+            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==0 or (random.random() < 2/3)]))
+        elif exp == 1:
+            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==0 or (random.random() < 5/6)]))
+        elif exp == 2:
+            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==1 or (random.random() < 5/6)]))
+        else:
+            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls)]))
+        if pairs:
+            p,g = pairs
+        else:
+            continue
+        prediction.append(torch.cat(p))
+        ground_truth += g
+
+    if prediction:
+        prediction = torch.stack(prediction)
+    if ground_truth:
+        ground_truth = torch.tensor(ground_truth).long().to(DEVICE)
+    return prediction, ground_truth
+
 # Model training and evaluation procedures
 def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_plan=False, clip_flag=False, scheduler = None):
     data = []
     acc_loss = 0
-    for game in lst:
+    loss = 0
+    l = None
+    scaler = GradScaler()
 
+    for game in lst:
         # Model file's function returns a list of ground truths and their associated predictions
         # Predictions are of the form ['NO', 'MAYBE','YES'] -> [0,1,2]
         # Predictions and ground truths at each time step occur for both players 1 and 2
-        l = model(game, global_plan=global_plan, player_plan=player_plan,clip=clip_flag)
-        prediction = []
-        ground_truth = []
-        for gt, prd in l:
-            lbls = [int(a==b) for a,b in zip(gt[0],gt[1])]
-            lbls += [['NO', 'MAYBE', 'YES'].index(gt[0][0]),['NO', 'MAYBE', 'YES'].index(gt[0][1])]
-            if gt[0][2] in game.materials_dict:
-                lbls.append(game.materials_dict[gt[0][2]])
-            else:
-                lbls.append(0)
-            lbls += [['NO', 'MAYBE', 'YES'].index(gt[1][0]),['NO', 'MAYBE', 'YES'].index(gt[1][1])]
-            if gt[1][2] in game.materials_dict:
-                lbls.append(game.materials_dict[gt[1][2]])
-            else:
-                lbls.append(0)
-            prd = prd[exp:exp+1]
-            lbls = lbls[exp:exp+1]
-            data.append([(g,torch.argmax(p).item()) for p,g in zip(prd,lbls)])
-            # p, g = zip(*[(p,torch.eye(p.shape[0]).float()[g]) for p,g in zip(prd,lbls)])
-            if exp == 0:
-                pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==0 or (random.random() < 2/3)]))
-            elif exp == 1:
-                pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==0 or (random.random() < 5/6)]))
-            elif exp == 2:
-                pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==1 or (random.random() < 5/6)]))
-            else:
-                pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls)]))
-            # print(pairs)
-            if pairs:
-                p,g = pairs
-            else:
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            l = model(game, global_plan=global_plan, player_plan=player_plan,clip=clip_flag)
+            prediction, ground_truth = construct_gt_pred(l, game, exp)
+            if not prediction or not ground_truth:
+                print("No predictions or truth found")
                 continue
-            # print(p,g)
-            prediction.append(torch.cat(p))
-
-            # ground_truth.append(torch.cat(g))
-            ground_truth += g
-
-        if prediction:
-            prediction = torch.stack(prediction)
-        else:
-            continue
-        if ground_truth:
-            # ground_truth = torch.stack(ground_truth).float().to(DEVICE)
-            ground_truth = torch.tensor(ground_truth).long().to(DEVICE)
-        else:
-            continue
-
-        loss = criterion(prediction,ground_truth)
+            loss = criterion(prediction,ground_truth)
 
         if model.training and (not optimizer is None):
-            loss.backward()
-            # nn.utils.clip_grad_norm_(model.parameters(), 10)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1)
-            optimizer.step()
+            #optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
         acc_loss += loss.item()
-        # return data, acc_loss + loss.item()
     print_epoch(data,acc_loss,lst)
     if scheduler:
         scheduler.step()
@@ -181,7 +183,7 @@ def main(args):
 
     clip = None
     if args.clip:
-        cfg = compose(config_name="conf")
+        cfg = OmegaConf.load("conf.yaml")
         OmegaConf.set_struct(cfg, False)
         ckpt = cfg.pop("ckpt")
         OmegaConf.set_struct(cfg, True)
@@ -189,6 +191,9 @@ def main(args):
         clip.load_ckpt(ckpt.path, strict=True)
         clip = torch.compile(clip)
         clip.eval()
+        assert (
+        hashlib.md5(open(ckpt.path, "rb").read()).hexdigest() == ckpt.checksum
+        ), "broken ckpt"
 
 
     if train_flag:
@@ -220,7 +225,7 @@ def main(args):
     num_epochs = 1000#1#
 
     #optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=0.2)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=0.001)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=0, last_epoch=-1, verbose=False)
 
