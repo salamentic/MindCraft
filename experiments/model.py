@@ -1,4 +1,7 @@
 import sys, torch, random
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+from x_transformers import Decoder, Encoder, TransformerWrapper
 from numpy.core.fromnumeric import reshape
 import torch.nn as nn, numpy as np
 
@@ -16,6 +19,7 @@ def onehot(x,n):
 class Model(nn.Module):
     def __init__(self, seq_model_type=0):
         super(Model, self).__init__()
+        self.seq_model_type = seq_model_type
 
         my_rnn = lambda i,o: nn.GRU(i,o)
         #my_rnn = lambda i,o: nn.LSTM(i,o)
@@ -38,7 +42,7 @@ class Model(nn.Module):
         drnn_in = 512 + 2 + q_emb + frame_emb
 
         # my_rnn = lambda i,o: nn.GRU(i,o)
-        my_rnn = lambda i,o: nn.LSTM(i,o)
+        #my_rnn = lambda i,o: nn.LSTM(i,o)
 
         if seq_model_type==0:
             self.dialogue_listener_rnn = nn.GRU(drnn_in,dlist_hidden)
@@ -61,6 +65,22 @@ class Model(nn.Module):
                 sincos_fun(x.shape[0]).float().to(DEVICE),
                 self.dialogue_listener_lin1(x).reshape(-1,1,dlist_hidden-2)
             ], axis=-1))[0]
+        elif seq_model_type==3:
+            print("Using Decoder based Transformer")
+            self.dialogue_listener = Decoder(
+                    dim = 1126,
+                    depth = 1,
+                    heads = 1,
+                    attn_num_mem_kv = 16, # 16 memory key / values
+                    attn_talking_heads = True,  # turn on information exchange between attention heads
+                    ff_glu=True,
+                    rel_pos_bias = True,  # adds relative positional bias to all attention layers, a la T5
+                    rotary_pos_emb = True,
+                    layer_dropout = 0.1,   # stochastic depth - dropout entire layer
+                    attn_dropout = 0.1,    # dropout post-attention
+                    ff_dropout = 0.1       # feedforward dropout
+            ).to(DEVICE)
+            self.final_ff = nn.Linear(1126, 1024).to(DEVICE)
         else:
             print('Sequence model type must be in (0: GRU, 1: LSTM, 2: Transformer), but got ', seq_model_type)
             exit()
@@ -75,6 +95,7 @@ class Model(nn.Module):
             nn.ReLU()
         )
 
+        '''
         self.conv = nn.Sequential(
             conv_block(   3,   8, 3, 1, 1),
             # conv_block(   3,   8, 5, 2, 2),
@@ -82,6 +103,8 @@ class Model(nn.Module):
             conv_block(  32, frame_emb//4, 5, 2, 2),
             nn.Conv2d( frame_emb//4, frame_emb, 3),nn.ReLU(),
         )
+        '''
+        self.conv = None
 
         qlayer = lambda i,o : nn.Sequential(
             nn.Linear(i,512),
@@ -107,7 +130,7 @@ class Model(nn.Module):
         self.q22 = qlayer(q_in_size,3)
         self.q23 = qlayer(q_in_size,22)
 
-    def forward(self,game,global_plan=False, player_plan=False, clip=False):
+    def forward(self,game,global_plan=False, player_plan=False, clip=True):
         retval = []
 
         l = list(game)
@@ -115,6 +138,7 @@ class Model(nn.Module):
 
         h = None
         f=c_f
+        assert f==c_f
 
         # TODO: Change this into an actual fix, the last frame should not have inverted dimensions???
         #f[-1] = f[-1] if f[-1].shape[0]==512 else f[-1].T
@@ -181,19 +205,26 @@ class Model(nn.Module):
             torch.tensor(d).float().to(DEVICE),
             torch.tensor(q).float().to(DEVICE),
             # FIX THIS TO OG!
+            #torch.tensor(f).float().to(DEVICE) if clip else
             torch.tensor(np.squeeze(f,axis=1) if len(f.shape)==3 else f).float().to(DEVICE) if clip else
             self.conv(torch.tensor(f).permute(0,2,1).float().to(DEVICE)).reshape(-1,512), # Use MineCLIP directly if possible
             ),axis=-1)
+
+        if self.seq_model_type==3:
+            u = torch.unsqueeze(u, 0)
+        # Original
         u = u.float().to(DEVICE)
 
         y = self.dialogue_listener(u)
         y = y.reshape(-1,y.shape[-1])
+        if self.seq_model_type==3:
+            y = self.final_ff(y)
+            y = y.reshape(-1,y.shape[-1])
         if all([x is None for x in l]):
             return []
 
         fun_lst = [self.q01,self.q02,self.q03,self.q11,self.q12,self.q13,self.q21,self.q22,self.q23]
         fun = lambda x: [f(x) for f in fun_lst]
-
 
         retval = [(_l,fun(torch.cat((plan_emb,torch.tensor(_q).float().to(DEVICE),_y)))) for _y, _q, _l in zip(y,q,l)if not _l is None]
         return retval
