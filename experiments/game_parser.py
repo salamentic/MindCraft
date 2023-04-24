@@ -7,9 +7,11 @@ import imageio
 from mineclip import MineCLIP
 from hydra import compose, initialize
 from omegaconf import OmegaConf
+import copy
 
-DEBUG = 0
-attn = False
+DEBUG = 1
+attn = True
+static = False
 
 
 random.seed(0)
@@ -22,7 +24,6 @@ def onehot(x,n):
     if x > 0:
         retval[x-1] = 1
     return retval
-
 
 class GameParser:
     def __init__(self, game_path, load_dialogue=True, pov=0, clip=None):
@@ -65,7 +66,6 @@ class GameParser:
         materials = glob('../mean/dist/img/materials/*.png') + glob('mean/dist/img/materials/*.png')
         materials = sorted([m.split('/')[-1].split('.')[0] for m in materials])
         materials = [m for m in materials if not 'NULL' in m]
-        # materials = [m for m in materials if not 'OBSIDIAN' in m]
         mines = [m for m in materials if 'PLANK' in m]
         materials = [m for m in materials if not 'PLANK' in m]
 
@@ -76,8 +76,6 @@ class GameParser:
         self.materials_dict = {x:i+1 for i,x in enumerate(materials)}
         self.mines_dict = {x:i+1 for i,x in enumerate(mines)}
         self.tools_dict = {x:i+1 for i,x in enumerate(tools)}
-
-        # print(len(self.materials_dict))
 
         self.global_plan = []
         mine_counter = 0
@@ -149,21 +147,28 @@ class GameParser:
 
         self.__iter_ts = self.start_ts
 
-    def clip_video_embedder(self, player_frames, pov_file, attn = False):
+    def clip_video_embedder(self, player_frames, pov_file):
         attn_str = "" if not attn else "_attn"
+        attn_str = "_static" if static else attn_str
+        clip_embed = None
         if 1==DEBUG and os.path.isfile(pov_file[:-4]+f'_clip{attn_str}_vid.npz'):
-            clip_embed = np.load(pov_file[:-4]+f'_clip{attn_str}_vid.npz')['data']
-            print("Loaded MineCLIP embed for P1", flush=True)
+            clip_embed = np.load(pov_file[:-4]+f'_clip{attn_str}_vid.npz', mmap_mode='r')['data']
+            print(f"Loaded {attn_str} MineCLIP embed for P1", flush=True)
         else:
-            clip_embed = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in player_frames[:self.vid_len]]
-            # If there are more than 16 frames, compute embeddings as a sliding window
-            # Results in as many embeddings as number of frames (Num Frames, 512)
-            if len(player_frames) >= self.vid_len:
-                sliding_window = np.lib.stride_tricks.sliding_window_view(player_frames, (self.vid_len, self.img_h, self.img_w, 3),writeable=False)
-                sliding_window = sliding_window.reshape((len(player_frames) - self.vid_len + 1, self.vid_len, self.img_h, self.img_w, 3))
-                clip_embed = np.concatenate((clip_embed, np.array([self.clip.encode_video(torch.Tensor(win.copy()).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
+            if static:
+                clip_embed = [self.clip.forward_video_features(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE))[None,:,:]).cpu().detach().numpy() for frame in player_frames]
                 np.savez_compressed(open(pov_file[:-4]+f'_clip{attn_str}_vid.npz','wb'), data=clip_embed)
-                print('Saved MineCLIP video embed for P1', flush=True)
+                print('Saved Static MineCLIP embed for P1', flush=True)
+            else:
+                clip_embed = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in player_frames[:self.vid_len]]
+                # If there are more than 16 frames, compute embeddings as a sliding window
+                # Results in as many embeddings as number of frames (Num Frames, 512)
+                if len(player_frames) >= self.vid_len:
+                    sliding_window = np.lib.stride_tricks.sliding_window_view(player_frames, (self.vid_len, self.img_h, self.img_w, 3),writeable=False)
+                    sliding_window = sliding_window.reshape((len(player_frames) - self.vid_len + 1, self.vid_len, self.img_h, self.img_w, 3))
+                    clip_embed = np.concatenate((clip_embed, np.array([self.clip.encode_video(torch.Tensor(win.copy()).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
+                    np.savez_compressed(open(pov_file[:-4]+f'_clip{attn_str}_vid.npz','wb'), data=clip_embed)
+                    print('Saved MineCLIP video embed for P1', flush=True)
         return clip_embed
 
     # ADDED: c_f to iterator retval
@@ -172,12 +177,12 @@ class GameParser:
             if self.load_dialogue:
                 d = [x for x in self.dialogue_events if x[0] == self.__iter_ts]
                 if d:
-                    self.last_d = d
+                    d = d
+                    self.last_d = copy.deepcopy(d)
                 else:
-                    # In theory u should change the iteration number, but does not matter much
                     d = self.last_d
             else:
-                d = None
+                d = self.last_d
 
             # q = [x for x in self.question_pairs if (x[0][0] < self.__iter_ts) and (x[0][1] > self.__iter_ts)]
             q = [x for x in self.question_pairs if (x[0][1] == self.__iter_ts)]
@@ -253,17 +258,10 @@ class GameParser:
                 # (F, [C,H,W]) -> [1,C,H,W] -> [1,512] -> tile to get [16,512] ->
                 # [1,16,512] -> [1,512]
                 # We can turn this into a sliding window of 16! Shoud not be that bad.
-
-                # Duplicate mode
                 if not self.clip:
                     self.clip_third = None
-                elif len(self.third_pers_frames) < self.vid_len:
-                    self.clip_third = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.third_pers_frames]
                 else:
-                    self.clip_third = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.third_pers_frames[:self.vid_len]]
-                    sliding_window = np.lib.stride_tricks.sliding_window_view(self.third_pers_frames, (self.vid_len, self.img_h, self.img_w, 3))
-                    sliding_window = sliding_window.reshape((len(self.third_pers_frames) - self.vid_len + 1, self.vid_len, self.img_h, self.img_w, 3))
-                    self.clip_third = np.concatenate((self.clip_third, np.array([self.clip.encode_video(torch.Tensor(win.copy()).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
+                    self.clip_third = self.clip_video_embedder(self.third_pers_frames, self.third_pers_file)
             else:
                 self.third_pers_frames = np.array([0])
                 self.clip_third=[np.zeros((1,512))]
@@ -277,7 +275,7 @@ class GameParser:
                 self.player1_pov_file = glob(os.path.join(self.game_path,'play1*gif'))[0]
                 np_file = self.player1_pov_file[:-3]+'npz'
                 if 1==DEBUG and os.path.isfile(np_file):
-                    self.player1_pov_frames = np.load(np_file)['data']
+                    self.player1_pov_frames = np.load(np_file, mmap_mode='r')['data']
                 else:
                     frames = imageio.get_reader(self.player1_pov_file, '.gif')
                     reshaper  = lambda x: cv2.resize(x,(self.img_w,self.img_h))
@@ -287,6 +285,7 @@ class GameParser:
                     np.savez_compressed(open(np_file,'wb'), data=self.player1_pov_frames)
                     print('saved', flush=True)
             except Exception as e:
+                print("P1", e)
                 self.player1_pov_frames = np.array([0])
 
             if self.player1_pov_frames.shape[0]//d < 10:
@@ -304,27 +303,12 @@ class GameParser:
                 if not self.clip:
                     self.clip_first = None
                 else:
-                    self.clip_first = clip_video_embedder(self.player1_pov_frames, self.player1_pov_file)
-            '''
-                if 1==DEBUG and os.path.isfile(self.player1_pov_file[:-4]+'_clip_vid.npz'):
-                    self.clip_first = np.load(self.player1_pov_file[:-4]+'_clip_vid.npz')['data']
-                    print("Loaded MineCLIP embed for P1", flush=True)
-                else:
-                    self.clip_first = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.player1_pov_frames[:self.vid_len]]
-                    # If there are more than 16 frames, compute embeddings as a sliding window
-                    # Results in as many embeddings as number of frames (Num Frames, 512)
-                    if len(self.player1_pov_frames) >= self.vid_len:
-                        sliding_window = np.lib.stride_tricks.sliding_window_view(self.player1_pov_frames, (self.vid_len, self.img_h, self.img_w, 3),writeable=False)
-                        sliding_window = sliding_window.reshape((len(self.player1_pov_frames) - self.vid_len + 1, self.vid_len, self.img_h, self.img_w, 3))
-                        self.clip_first = np.concatenate((self.clip_first, np.array([self.clip.encode_video(torch.Tensor(win.copy()).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
-                    np.savez_compressed(open(self.player1_pov_file[:-4]+'_clip_vid.npz','wb'), data=self.clip_first)
-                    print('Saved MineCLIP video embed for P1', flush=True)
-            '''
+                    self.clip_first = self.clip_video_embedder(self.player1_pov_frames, self.player1_pov_file)
             else:
-                print(self.player1_pov_frames)
+                # Consider making this an unsqueeze alternative
+                print("ZEROES:", self.player1_pov_frames)
                 self.player1_pov_frames = np.array([0])
                 self.clip_first=[np.zeros((1,512))]
-                print("ZEROES")
         else:
             self.player1_pov_frames = np.array([0])
             self.clip_first = np.array([0])
@@ -334,7 +318,7 @@ class GameParser:
                 self.player2_pov_file = glob(os.path.join(self.game_path,'play2*gif'))[0]
                 np_file = self.player2_pov_file[:-3]+'npz'
                 if 1==DEBUG and os.path.isfile(np_file):
-                    self.player2_pov_frames = np.load(np_file)['data']
+                    self.player2_pov_frames = np.load(np_file, mmap_mode='r')['data']
                 else:
                     frames = imageio.get_reader(self.player2_pov_file, '.gif')
                     reshaper  = lambda x: cv2.resize(x,(self.img_w,self.img_h))
@@ -343,6 +327,7 @@ class GameParser:
                     np.savez_compressed(open(np_file,'wb'), data=self.player2_pov_frames)
                     print('saved', flush=True)
             except Exception as e:
+                print("P2", e)
                 self.player2_pov_frames = np.array([0])
 
             if self.player2_pov_frames.shape[0]//d < 10:
@@ -360,28 +345,12 @@ class GameParser:
                 if not self.clip:
                     self.clip_second = None
                 else:
-                    self.clip_second = clip_video_embedder(self.player2_pov_frames, self.player2_pov_file)
-                '''
-                elif 1==DEBUG and os.path.isfile(self.player2_pov_file[:-4]+'_clip_vid.npz'):
-                    self.clip_second = np.load(self.player2_pov_file[:-4]+'_clip_vid.npz')['data']
-                    print("Loaded MineCLIP embed for P2", flush=True)
-                else:
-                    # Compute windows for initial 16 frames efficiently via tiling
-                    self.clip_second = [self.clip.forward_video_features(torch.tile(self.clip.forward_image_features(torch.Tensor(frame).permute(2,0,1)[None,:,:,:].to(DEVICE)),(16,1))[None,:,:]).cpu().detach().numpy() for frame in self.player2_pov_frames[:self.vid_len]]
-
-                    # If there are more than 16 frames, compute embeddings as a sliding window
-                    # Results in as many embeddings as number of frames (Num Frames, 512)
-                    if len(self.player2_pov_frames) >= self.vid_len:
-                        sliding_window = np.lib.stride_tricks.sliding_window_view(self.player2_pov_frames, (self.vid_len, self.img_h, self.img_w, 3), writeable=False)
-                        sliding_window = sliding_window.reshape((len(self.player2_pov_frames) - self.vid_len + 1, self.vid_len, self.img_h, self.img_w, 3))
-                        self.clip_second = np.concatenate((self.clip_second, np.array([self.clip.encode_video(torch.Tensor(win.copy()).permute(0,3,1,2).to(DEVICE)[None,:,:,:,:]).cpu().detach().numpy() for win in sliding_window])), axis=0)
-                    np.savez_compressed(open(self.player2_pov_file[:-4]+'_clip_vid.npz','wb'), data=self.clip_second)
-                    print('Saved MineCLIP video embed for P2', flush=True)
-                '''
+                    self.clip_second = self.clip_video_embedder(self.player2_pov_frames, self.player2_pov_file)
             else:
+                # Consider making this an unsqueeze alternative
+                print("ZEROES:", self.player2_pov_frames)
                 self.clip_second=[np.zeros((1,512))]
                 self.player2_pov_frames = np.array([0])
-                print("ZEROES")
         else:
             self.player2_pov_frames = np.array([0])
             self.clip_second = np.array([0])
@@ -461,7 +430,8 @@ class GameParser:
         self.dialogue_events = []
         # if not self.load_dialogue:
         #     return
-        save_path = os.path.join(self.game_path,f'clip_dialogue_{self.game_path.split("/")[1]}.pkl')
+        attn_str = "" if not attn else "_attn"
+        save_path = os.path.join(self.game_path,f'clip{attn_str}_dialogue_{self.game_path.split("/")[1]}.pkl')
         if 1==DEBUG and os.path.isfile(save_path):
             self.dialogue_events = pickle.load(open( save_path, "rb" ))
             print("Loaded MineCLIP Dialogue Embeddings", flush=True)

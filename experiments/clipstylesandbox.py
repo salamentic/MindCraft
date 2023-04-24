@@ -12,22 +12,19 @@ from torch.cuda.amp import GradScaler
 import lightning.pytorch as pl
 
 from game_parser import GameParser
-from model import Model
+from clipstylemodel import Model
 
 from mineclip import MineCLIP
 from omegaconf import OmegaConf
+#MODE = 'finetune_embed'
+MODE = 'classic'
+#MODE = 'zero_shot'
+print(f"Performing {MODE} contrastive training")
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Where the data and model weight folders are stored
 scratch_dir = '/scratch/eecs692w23_class_root/eecs692w23_class/anrao/'
-
-# Given label number x and total labels n, convert into a one hot vector of shape (1,n)
-def onehot(x,n):
-    retval = np.zeros(n)
-    if x > 0:
-        retval[x-1] = 1
-    return retval
 
 # Statistics
 def print_epoch(data,acc_loss,lst, val=False):
@@ -41,7 +38,7 @@ def print_epoch(data,acc_loss,lst, val=False):
             print(f'({accuracy_score(a,b):5.3f},{f1_score(a,b,average="weighted"):5.3f},{sum(a)/len(a):5.3f},{sum(b)/len(b):5.3f},{len(b)})', end=' ',flush=True)
         else:
             print(f'({accuracy_score(a,b):5.3f},{f1_score(a,b,average="weighted"):5.3f},{len(b)})', end=' ',flush=True)
-            wandb.log({val_str+"acc": accuracy_score(a,b), val_str+"acc_loss": acc_loss/len(lst), val_str+"f1":f1_score(a,b,average="weighted")})
+            #wandb.log({val_str+"acc": accuracy_score(a,b), val_str+"acc_loss": acc_loss/len(lst), val_str+"f1":f1_score(a,b,average="weighted")})
     print('', end='; ',flush=True)
 
 # Make splits for training and evaluation procedures. Shouldn't care much here.
@@ -69,82 +66,72 @@ def construct_gt_pred(l, game, exp):
     for gt, prd in l:
         # lbls = [int(a==b) for a,b in zip(gt[0],gt[1])]
         lbls = np.equal(gt[0],gt[1]).astype(int).tolist()
-        lbls += [['NO', 'MAYBE', 'YES'].index(gt[0][0]),['NO', 'MAYBE', 'YES'].index(gt[0][1])]
+        lbls += [['YES', 'MAYBE', 'NO'].index(gt[0][0]),['YES', 'MAYBE', 'NO'].index(gt[0][1])]
         if gt[0][2] in game.materials_dict:
             lbls.append(game.materials_dict[gt[0][2]])
         else:
             lbls.append(0)
-        lbls += [['NO', 'MAYBE', 'YES'].index(gt[1][0]),['NO', 'MAYBE', 'YES'].index(gt[1][1])]
+        lbls += [['YES', 'MAYBE', 'NO'].index(gt[1][0]),['YES', 'MAYBE', 'NO'].index(gt[1][1])]
         if gt[1][2] in game.materials_dict:
             lbls.append(game.materials_dict[gt[1][2]])
         else:
             lbls.append(0)
+
         prd = prd[exp:exp+1]
         lbls = lbls[exp:exp+1]
-        data.append([(g,torch.argmax(p).item()) for p,g in zip(prd,lbls)])
+        pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls)]))
+        data.append([(g,torch.argmax(p.softmax(dim=-1).detach().cpu())) for p,g in zip(prd,lbls)])
 
-        # Mainly for experiments 0,1 and 2; Not relevant here.
-        # p, g = zip(*[(p,torch.eye(p.shape[0]).float()[g]) for p,g in zip(prd,lbls)])
-        if exp == 0:
-            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==0 or (random.random() < 2/3)]))
-        elif exp == 1:
-            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==0 or (random.random() < 5/6)]))
-        elif exp == 2:
-            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls) if gt==1 or (random.random() < 5/6)]))
-        else:
-            pairs = list(zip(*[(pr,gt) for pr,gt in zip(prd,lbls)]))
-            #pairs = torch.cat((prd, lbls), dim=1).tolist()
         if pairs:
             p,g = pairs
         else:
             continue
-        prediction.append(torch.cat(p))
+        prediction.append(p)
         ground_truth += g
 
-    if prediction:
-        prediction = torch.stack(prediction)
     if ground_truth:
         ground_truth = torch.tensor(ground_truth).long().to(DEVICE)
     return prediction, ground_truth, data
 
-# Model training and evaluation procedures
-def do_split(model,lst,exp,criterion,optimizer=None,global_plan=False, player_plan=False, clip_flag=False, scheduler = None):
-    skipped = 0
+def clip_split(model, clip_model, lst, exp, criterion, optimizer):
     data = []
-    acc_loss = 0
-    loss = 0
-    l = None
-    scaler = GradScaler()
-
-    accum_steps = 8
-
     for i_game, game in enumerate(lst):
-        # Model file's function returns a list of ground truths and their associated predictions
-        l = model(game, global_plan=global_plan, player_plan=player_plan,clip=clip_flag)
-        prediction, ground_truth, data_temp = construct_gt_pred(l, game, exp)
-        data += data_temp
+        _,d,q,f,c_f = zip(*list(game))
+        l, questions, video_feats = model(game, global_plan=True, player_plan=True,clip=True)
+        print(video_feats)
+        acc_loss = 0
+        embedding, ground_truth, data_temp = construct_gt_pred(l, game, exp)
 
-        if prediction == None or ground_truth == None or len(prediction) == 0 or len(ground_truth) == 0:
-            print("No predictions or truth found")
-            skipped += 1
+        exp_indexer = {3:0,4:1,5:2,6:0,7:1,8:2}
+        loss = 0
+        pred = []
+        for q_i, question in enumerate(questions):
+            if MODE == "zero_shot":
+                temp_embed = torch.stack([torch.Tensor(video_feats[q_i])], 0)
+                print(clip_model.forward_reward_head(temp_embed.to(DEVICE), text_tokens=question[exp_indexer[exp]]))
+                pred.append(clip_model.forward_reward_head(temp_embed.to(DEVICE), text_tokens=question[exp_indexer[exp]])[0].softmax(dim=-1))
+            else:
+                if MODE != "finetune_embed":
+                    text_feats_batch = torch.nn.functional.normalize(clip_model.encode_text(question[exp_indexer[exp]]))
+                else:
+                    text_feats_batch = torch.nn.functional.normalize(question[exp_indexer[exp]])
+                pred.append((torch.matmul(torch.nn.functional.normalize(torch.unsqueeze(embedding[q_i][0],0)), torch.transpose(text_feats_batch, 0, 1))*model.logit_scale.exp()).softmax(dim=-1))
+        if len(pred) == 0:
             continue
-        loss = criterion(prediction,ground_truth)
-
+        pred_shaped = torch.squeeze(torch.stack(pred), 1)
+        pred_argmax = torch.argmax(pred_shaped.detach().cpu(), axis=1).tolist()
+        data.append([(g,p) for p,g in zip(pred_argmax,ground_truth.tolist())])
+        #print(pred_shaped)
+        #print(ground_truth)
+        loss = criterion(pred_shaped, ground_truth)
         if model.training and (not optimizer is None):
             loss.backward()
-
-            if (i_game+1) % accum_steps == 0:
-                nn.utils.clip_grad_norm_(model.parameters(), 5)
-                optimizer.step()
-                optimizer.zero_grad()
-
-            if i_game==len(lst)-1 and len(lst) % accum_steps != 0:
-                nn.utils.clip_grad_norm_(model.parameters(), 5)
-                optimizer.step()
-                optimizer.zero_grad()
+            nn.utils.clip_grad_norm_(model.parameters(), 1)
+            optimizer.step()
+            optimizer.zero_grad()
         acc_loss += loss.item()
     print_epoch(data,acc_loss,lst, val=False if model.training else True)
-    print(f"Skipped {skipped} games of {len(lst)} this epoch.")
+    #print(f"Skipped {skipped} games of {len(lst)} this epoch.")
     return acc_loss, data
 
 def main(args):
@@ -234,36 +221,19 @@ def main(args):
             print('POV must be in [None, First, Third], but got', args.pov)
             exit()
 
-    model = Model(seq_model).to(DEVICE)
+    model = Model(seq_model, clip_model=clip).to(DEVICE)
 
     print(model)
     if train_flag:
         model.train()
 
-    learning_rate = 1e-5
-    weight_decay = 1e-4
+    learning_rate = 2e-4
+    weight_decay = 1e-3
     num_epochs = 1000#1#
 
     #optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
-
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="MindCraft",
-
-        # track hyperparameters and run metadata
-        config={
-            "learning_rate": learning_rate,
-            "architecture": args.seq_model,
-            "Experiment Number": args.experiment,
-            "weight_decay": weight_decay,
-            "scheduler": "None",
-            "CLIP": "Yes",
-            "Video": "Yes",
-            "CLIP-Agg": "Attn",
-        })
-    print(str(criterion), str(optimizer))
 
     min_acc_loss = 100
     max_f1 = 0
@@ -277,10 +247,11 @@ def main(args):
             print(f"Epoch {epoch} Training:")
             shuffle(train)
             model.train()
-            do_split(model,train,args.experiment,criterion,optimizer=optimizer,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip, scheduler=scheduler)
+            acc_loss, data = clip_split(model, clip, train, args.experiment, criterion, optimizer)
             print(f"Epoch {epoch} Validation:")
             model.eval()
-            acc_loss, data = do_split(model,val,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip)
+            #acc_loss, data = do_split(model,val,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan, clip_flag=args.clip)
+            acc_loss, data = clip_split(model, clip, val, args.experiment, criterion, optimizer)
 
             data = list(zip(*data))
             for x in data:
@@ -325,12 +296,10 @@ def main(args):
     else:
         print('POV must be in [None, First, Third], but got', args.pov)
 
-    clip_split(clip, test, criterion)
     model.eval()
-    _, data = do_split(model,test,args.experiment,criterion,global_plan=global_plan, player_plan=player_plan, clip_flag=True)
+    clip_split(model, clip, test, args.experiment, criterion, optimizer)
 
     print()
-    wandb.finish()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process some integers.')
